@@ -15,7 +15,7 @@ gitlab-ci 自动构建-部署-预览 demo
 *.example.com A 192.168.1.10
 ```
 ## 项目设置
-在项目 Settings -> Integrations -> Kubernetes, 或 Admin Area -> Service Templates -> Kubernetes 中激活并设置 `KUBE_URL(API URL)`, `KUBE_CA_PEM(CA Certificate)`, `KUBE_TOKEN(Token)` 参数
+在项目 `Settings` -> `Integrations` -> `Kubernetes`, 或 `Admin Area` -> `Service Templates` -> `Kubernetes` 中激活并设置 `KUBE_URL(API URL)`, `KUBE_CA_PEM(CA Certificate)`, `KUBE_TOKEN(Token)` 参数
 ## 修改 `.gitlab-ci.yml`
 ```
 AUTO_DEVOPS_DOMAIN: example.com # 你的域名
