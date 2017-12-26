@@ -1,0 +1,308 @@
+variables:
+  # 以下3个变量可以在 Settings -> Integrations -> Kubernetes, 或 Admin Area -> Service Templates -> Kubernetes 中设置
+  # $KUBE_URL
+  # $KUBE_CA_PEM
+  # $KUBE_TOKEN
+  # 用于预览的域名 *.example.com A 192.168.1.10
+  AUTO_DEVOPS_DOMAIN: example.com
+  # 不带标签的镜像仓库地址
+  CI_REGISTRY_IMAGE: registry.example.com/auto-devops-demo
+
+image: auto-devops:alpine
+
+stages:
+  - build
+  - test
+  - review
+  - staging
+  - canary
+  - production
+  - cleanup
+
+build:
+  stage: build
+  image: docker
+  services:
+    - docker:dind
+  script:
+    - build
+  only:
+    - branches
+
+review:
+  stage: review
+  script:
+    - deploy
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    url: http://$CI_PROJECT_PATH_SLUG-$CI_ENVIRONMENT_SLUG.$AUTO_DEVOPS_DOMAIN
+    on_stop: stop_review
+  only:
+    refs:
+      - branches
+    kubernetes: active
+  except:
+    - master
+
+stop_review:
+  stage: cleanup
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - delete
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    action: stop
+  when: manual
+  allow_failure: true
+  only:
+    refs:
+      - branches
+    kubernetes: active
+  except:
+    - master
+
+# Keys that start with a dot (.) will not be processed by GitLab CI.
+# Staging and canary jobs are disabled by default, to enable them
+# remove the dot (.) before the job name.
+# https://docs.gitlab.com/ee/ci/yaml/README.html#hidden-keys
+
+# Staging deploys are disabled by default since
+# continuous deployment to production is enabled by default
+# If you prefer to automatically deploy to staging and
+# only manually promote to production, enable this job by removing the dot (.),
+# and uncomment the `when: manual` line in the `production` job.
+
+staging:
+  stage: staging
+  script:
+    - deploy
+  environment:
+    name: staging
+    url: http://$CI_PROJECT_PATH_SLUG-staging.$AUTO_DEVOPS_DOMAIN
+  only:
+    refs:
+      - master
+    kubernetes: active
+
+# Canaries are disabled by default, but if you want them,
+# and know what the downsides are, enable this job by removing the dot (.),
+# and uncomment the `when: manual` line in the `production` job.
+
+canary:
+  stage: canary
+  script:
+    - deploy canary
+  environment:
+    name: production
+    url: http://$CI_PROJECT_PATH_SLUG.$AUTO_DEVOPS_DOMAIN
+  artifacts:
+    paths:
+    - deploy.yaml
+  when: manual
+  only:
+    refs:
+      - master
+    kubernetes: active
+
+# This job continuously deploys to production on every push to `master`.
+# To make this a manual process, either because you're enabling `staging`
+# or `canary` deploys, or you simply want more control over when you deploy
+# to production, uncomment the `when: manual` line in the `production` job.
+
+production:
+  stage: production
+  script:
+    - deploy
+    - delete canary
+  environment:
+    name: production
+    url: http://$CI_PROJECT_PATH_SLUG.$AUTO_DEVOPS_DOMAIN
+  when: manual
+  only:
+    refs:
+      - master
+    kubernetes: active
+
+# ---------------------------------------------------------------------------
+
+.auto_devops: &auto_devops |
+  [[ "$TRACE" ]] && set -x
+  export CI_APPLICATION_REPOSITORY=$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG
+  export CI_APPLICATION_TAG=$CI_COMMIT_SHA
+
+  function deploy() {
+    create_kubeconfig
+    ensure_namespace
+    
+    track="${1-stable}"
+    name="$CI_ENVIRONMENT_SLUG"
+
+    if [[ "$track" != "stable" ]]; then
+      name="$name-$track"
+    fi
+
+    replicas="1"
+
+    env_track=$( echo $track | tr -s  '[:lower:]'  '[:upper:]' )
+    env_slug=$( echo ${CI_ENVIRONMENT_SLUG//-/_} | tr -s  '[:lower:]'  '[:upper:]' )
+
+    if [[ "$track" == "stable" ]]; then
+      # for stable track get number of replicas from `PRODUCTION_REPLICAS`
+      eval new_replicas=\$${env_slug}_REPLICAS
+    else
+      # for all tracks get number of replicas from `CANARY_PRODUCTION_REPLICAS`
+      eval new_replicas=\$${env_track}_${env_slug}_REPLICAS
+    fi
+    if [[ -n "$new_replicas" ]]; then
+      replicas="$new_replicas"
+    fi
+    CI_ENVIRONMENT_HOSTNAME="${CI_ENVIRONMENT_URL}"
+    CI_ENVIRONMENT_HOSTNAME="${CI_ENVIRONMENT_HOSTNAME/http:\/\//}"
+    CI_ENVIRONMENT_HOSTNAME="${CI_ENVIRONMENT_HOSTNAME/https:\/\//}"
+
+    echo "正在创建 deploy.yaml, $CI_ENVIRONMENT_SLUG (name:$name, track:$track, replicas:$replicas, image:$CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG)..."
+    # cat <<EOF | kubectl apply -n $KUBE_NAMESPACE --force -f -
+    cat <<EOF > deploy.yaml
+  apiVersion: extensions/v1beta1
+  kind: Deployment
+  metadata:
+    name: $name
+    namespace: $KUBE_NAMESPACE
+    labels:
+      app: $CI_ENVIRONMENT_SLUG
+      track: "$track"
+      version: "$CI_PIPELINE_ID-$CI_JOB_ID"
+  spec:
+    replicas: $replicas
+    template:
+      metadata:
+        labels:
+          name: $name
+          app: $CI_ENVIRONMENT_SLUG
+          track: "$track"
+      spec:
+        containers:
+        - name: app
+          image: $CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG
+          imagePullPolicy: IfNotPresent
+          ports:
+          - name: web
+            containerPort: 80
+  ---
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: $CI_ENVIRONMENT_SLUG
+    namespace: $KUBE_NAMESPACE
+    labels:
+      app: $CI_ENVIRONMENT_SLUG
+      version: "$CI_PIPELINE_ID-$CI_JOB_ID"
+  spec:
+    ports:
+    - name: web
+      port: 80
+      targetPort: web
+    selector:
+      app: $CI_ENVIRONMENT_SLUG
+  ---
+  apiVersion: extensions/v1beta1
+  kind: Ingress
+  metadata:
+    name: $CI_ENVIRONMENT_SLUG
+    namespace: $KUBE_NAMESPACE
+    labels:
+      app: $CI_ENVIRONMENT_SLUG
+      version: "$CI_PIPELINE_ID-$CI_JOB_ID"
+    annotations:
+      nginx.ingress.kubernetes.io/rewrite-target: /
+      kubernetes.io/tls-acme: "true"
+      # kubernetes.io/ingress.class: "nginx"
+  spec:
+    tls:
+    - hosts:
+      - $CI_ENVIRONMENT_HOSTNAME
+      secretName: ${CI_ENVIRONMENT_SLUG}-tls
+    rules:
+    - host: $CI_ENVIRONMENT_HOSTNAME
+      http:
+        paths:
+        - path: /
+          backend:
+            serviceName: $CI_ENVIRONMENT_SLUG
+            servicePort: 80
+  EOF
+
+    cat deploy.yaml
+
+    echo "正在部署..."
+    kubectl describe namespace "$KUBE_NAMESPACE" || kubectl create namespace "$KUBE_NAMESPACE"
+    kubectl apply -n $KUBE_NAMESPACE --force -f deploy.yaml
+    kubectl rollout status -n "$KUBE_NAMESPACE" -w "deployment/$name"
+  }
+
+  function ensure_namespace() {
+    kubectl describe namespace "$KUBE_NAMESPACE" || kubectl create namespace "$KUBE_NAMESPACE"
+  }
+
+  function build() {
+    if ! docker info &>/dev/null; then
+      if [ -z "$DOCKER_HOST" -a "$KUBERNETES_PORT" ]; then
+        echo '设置 DOCKER_HOST=tcp://localhost:2375'
+        export DOCKER_HOST='tcp://localhost:2375'
+      fi
+    fi
+
+    if [[ -f Dockerfile ]]; then
+      echo "正在打包镜像 Dockerfile..."
+      docker build -t "$CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG" .
+    fi
+
+    #    if [[ -n "$CI_REGISTRY_USER" ]]; then
+    #      echo "Logging to GitLab Container Registry with CI credentials..."
+    #      docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    #      echo ""
+    #    fi
+
+    echo "正在发布到镜像仓库..."
+    docker push "$CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG"
+    echo ""
+  }
+
+  function delete() {
+    echo "正在删除旧的部署..."
+    create_kubeconfig
+    track="${1-stable}"
+    name="$CI_ENVIRONMENT_SLUG"
+
+    if [[ "$track" != "stable" ]]; then
+      name="$name-$track"
+    fi
+
+    kubectl delete all,ing -l "app=$name" -n "$KUBE_NAMESPACE"
+  }
+  
+  create_kubeconfig() {
+    [[ -z "$KUBE_URL" ]] && return
+
+    echo "正在生成 kubeconfig..."
+    export KUBECONFIG="$(pwd)/kubeconfig"
+    export KUBE_CLUSTER_OPTIONS=
+    if [[ -n "$KUBE_CA_PEM" ]]; then
+      echo "正在生成认证文件 $(pwd)/kube.ca.pem..."
+      echo "$KUBE_CA_PEM" > "$(pwd)/kube.ca.pem"
+      export KUBE_CLUSTER_OPTIONS=--certificate-authority="$(pwd)/kube.ca.pem"
+    fi
+    kubectl config set-cluster gitlab-deploy --server="$KUBE_URL" \
+      $KUBE_CLUSTER_OPTIONS
+    kubectl config set-credentials gitlab-deploy --token="$KUBE_TOKEN" \
+      $KUBE_CLUSTER_OPTIONS
+    kubectl config set-context gitlab-deploy \
+      --cluster=gitlab-deploy --user=gitlab-deploy \
+      --namespace="$KUBE_NAMESPACE"
+    kubectl config use-context gitlab-deploy
+    echo ""
+  }
+
+before_script:
+  - *auto_devops
