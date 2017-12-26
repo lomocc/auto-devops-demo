@@ -8,7 +8,7 @@ variables:
   # 不带标签的镜像仓库地址
   CI_REGISTRY_IMAGE: registry.example.com/auto-devops-demo
 
-image: auto-devops:alpine
+image: lomocc/auto-devops:alpine
 
 stages:
   - build
