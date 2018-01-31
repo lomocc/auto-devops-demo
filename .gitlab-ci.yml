@@ -8,14 +8,13 @@ variables:
   # 不带标签的镜像仓库地址
   CI_REGISTRY_IMAGE: registry.example.com/auto-devops-demo
 
-image: lomocc/auto-devops:alpine
+image: modules/kubectl
 
 stages:
   - build
   - test
   - review
   - staging
-  - canary
   - production
   - cleanup
 
@@ -85,25 +84,6 @@ staging:
       - master
     kubernetes: active
 
-# Canaries are disabled by default, but if you want them,
-# and know what the downsides are, enable this job by removing the dot (.),
-# and uncomment the `when: manual` line in the `production` job.
-
-canary:
-  stage: canary
-  script:
-    - deploy canary
-  environment:
-    name: production
-    url: http://$CI_PROJECT_PATH_SLUG.$AUTO_DEVOPS_DOMAIN
-  artifacts:
-    paths:
-    - deploy.yaml
-  when: manual
-  only:
-    refs:
-      - master
-    kubernetes: active
 
 # This job continuously deploys to production on every push to `master`.
 # To make this a manual process, either because you're enabling `staging`
@@ -114,10 +94,12 @@ production:
   stage: production
   script:
     - deploy
-    - delete canary
   environment:
     name: production
     url: http://$CI_PROJECT_PATH_SLUG.$AUTO_DEVOPS_DOMAIN
+  artifacts:
+    paths:
+    - deployment.yaml
   when: manual
   only:
     refs:
@@ -157,87 +139,25 @@ production:
     if [[ -n "$new_replicas" ]]; then
       replicas="$new_replicas"
     fi
-    CI_ENVIRONMENT_HOSTNAME="${CI_ENVIRONMENT_URL}"
-    CI_ENVIRONMENT_HOSTNAME="${CI_ENVIRONMENT_HOSTNAME/http:\/\//}"
-    CI_ENVIRONMENT_HOSTNAME="${CI_ENVIRONMENT_HOSTNAME/https:\/\//}"
-
-    echo "正在创建 deploy.yaml, $CI_ENVIRONMENT_SLUG (name:$name, track:$track, replicas:$replicas, image:$CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG)..."
+    hostname=${CI_ENVIRONMENT_URL/http*:\/\//}
+    
+    # export env for envsubst
+    export CI_KUBE_NAME=$name
+    export CI_KUBE_TRACK=$track
+    export CI_KUBE_REPLICAS=$replicas
+    export CI_KUBE_HOSTNAME=$hostname
+    
+    echo "$CI_KUBE_NAME, $CI_KUBE_TRACK, $CI_KUBE_REPLICAS, $CI_KUBE_HOSTNAME"
+    
+    echo "正在创建 deployment.yaml, $CI_ENVIRONMENT_SLUG (name:$name, track:$track, replicas:$replicas, image:$CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG)..."
     # cat <<EOF | kubectl apply -n $KUBE_NAMESPACE --force -f -
-    cat <<EOF > deploy.yaml
-  apiVersion: extensions/v1beta1
-  kind: Deployment
-  metadata:
-    name: $name
-    namespace: $KUBE_NAMESPACE
-    labels:
-      app: $CI_ENVIRONMENT_SLUG
-      track: "$track"
-      version: "$CI_PIPELINE_ID-$CI_JOB_ID"
-  spec:
-    replicas: $replicas
-    template:
-      metadata:
-        labels:
-          name: $name
-          app: $CI_ENVIRONMENT_SLUG
-          track: "$track"
-      spec:
-        containers:
-        - name: app
-          image: $CI_APPLICATION_REPOSITORY:$CI_APPLICATION_TAG
-          imagePullPolicy: IfNotPresent
-          ports:
-          - name: web
-            containerPort: 80
-  ---
-  apiVersion: v1
-  kind: Service
-  metadata:
-    name: $CI_ENVIRONMENT_SLUG
-    namespace: $KUBE_NAMESPACE
-    labels:
-      app: $CI_ENVIRONMENT_SLUG
-      version: "$CI_PIPELINE_ID-$CI_JOB_ID"
-  spec:
-    ports:
-    - name: web
-      port: 80
-      targetPort: web
-    selector:
-      app: $CI_ENVIRONMENT_SLUG
-  ---
-  apiVersion: extensions/v1beta1
-  kind: Ingress
-  metadata:
-    name: $CI_ENVIRONMENT_SLUG
-    namespace: $KUBE_NAMESPACE
-    labels:
-      app: $CI_ENVIRONMENT_SLUG
-      version: "$CI_PIPELINE_ID-$CI_JOB_ID"
-    annotations:
-      nginx.ingress.kubernetes.io/rewrite-target: /
-      kubernetes.io/tls-acme: "true"
-      # kubernetes.io/ingress.class: "nginx"
-  spec:
-    tls:
-    - hosts:
-      - $CI_ENVIRONMENT_HOSTNAME
-      secretName: ${CI_ENVIRONMENT_SLUG}-tls
-    rules:
-    - host: $CI_ENVIRONMENT_HOSTNAME
-      http:
-        paths:
-        - path: /
-          backend:
-            serviceName: $CI_ENVIRONMENT_SLUG
-            servicePort: 80
-  EOF
-
-    cat deploy.yaml
-
+    # envsubst < deployment.yml | kubectl apply -n $KUBE_NAMESPACE --force -f - 
+    envsubst < .deployment.yml > deployment.yml
+    cat deployment.yml
+    
     echo "正在部署..."
     kubectl describe namespace "$KUBE_NAMESPACE" || kubectl create namespace "$KUBE_NAMESPACE"
-    kubectl apply -n $KUBE_NAMESPACE --force -f deploy.yaml
+    kubectl apply -n $KUBE_NAMESPACE --force -f deployment.yml
     kubectl rollout status -n "$KUBE_NAMESPACE" -w "deployment/$name"
   }
 
